@@ -10,14 +10,19 @@ namespace {
 // p points at the first payload byte (device_type, i.e. frame byte 7).
 // Payload CRC has already validated these bytes, so they are trusted here.
 std::expected<InputsPayload, ParseError>
-build_payload(const std::uint8_t* p, std::uint8_t device_type,
+build_payload(const std::uint8_t* p, std::uint8_t device_type_byte,
               std::uint8_t payload_len) {
-    switch (device_type) {
-        case kDeviceTypeDio: {
-            if (payload_len != kDioPayloadLength) {
+    const auto dt = device_type_from_byte(device_type_byte);
+    if (!dt) {
+        return std::unexpected(ParseError::UnknownDeviceType);
+    }
+
+    switch (*dt) {
+        case DeviceType::DigitalIo: {
+            if (payload_len != kDigitalIoPayloadLength) {
                 return std::unexpected(ParseError::LengthMismatch);
             }
-            DioInputs in{};
+            DigitalIoInputs in{};
             in.hw_revision   = p[1];
             in.fw_major      = p[2];
             in.fw_minor      = p[3];
@@ -27,7 +32,7 @@ build_payload(const std::uint8_t* p, std::uint8_t device_type,
             in.digital_in[3] = p[7];
             return InputsPayload{in};
         }
-        case kDeviceTypePushButton: {
+        case DeviceType::PushButton: {
             if (payload_len != kPushButtonPayloadLength) {
                 return std::unexpected(ParseError::LengthMismatch);
             }
@@ -39,16 +44,17 @@ build_payload(const std::uint8_t* p, std::uint8_t device_type,
             in.white_button = p[5];
             return InputsPayload{in};
         }
-        default:
-            return std::unexpected(ParseError::UnknownDeviceType);
     }
+    // Unreachable: device_type_from_byte already rejected unknown values.
+    // Present to satisfy the compiler's control-flow analysis.
+    return std::unexpected(ParseError::UnknownDeviceType);
 }
 
 }  // namespace
 
 void FrameParser::feed(std::span<const std::uint8_t> bytes) {
-    // Compact consumed bytes so the buffer never grows unbounded. pos_ is
-    // always 0 after a feed; consumed garbage/frames are reclaimed here.
+    // Compact consumed bytes so the buffer never grows unbounded. After a
+    // feed, pos_ is always 0; consumed garbage/frames are reclaimed here.
     if (pos_ > 0) {
         buffer_.erase(buffer_.begin(),
                       buffer_.begin() + static_cast<std::ptrdiff_t>(pos_));
@@ -76,7 +82,7 @@ std::optional<FrameParser::Result> FrameParser::next() {
 
         // 2. A full header is needed before anything can be trusted.
         if (avail < kHeaderSize) {
-            return std::nullopt;  // truncated mid-header: wait for more
+            return std::nullopt;  // truncated mid-header: wait for more bytes
         }
 
         const std::uint8_t* f = buffer_.data() + pos_;
@@ -91,14 +97,38 @@ std::optional<FrameParser::Result> FrameParser::next() {
             continue;
         }
 
-        // 4. Header valid -> payload length is byte 5.
+        // 4. Header valid -> dispatch on SAP. Generic validation above is
+        //    SAP-agnostic; SAP-specific handling begins here. Adding a frame
+        //    type = a new value in the Sap enum + an arm in this dispatch.
+        const auto sap = sap_from_byte(f[4]);
+        if (!sap) {
+            // Aligned, header-valid, unknown frame type. Consume the header
+            // and surface it loudly rather than dropping silently — a
+            // half-wired new SAP then fails informatively for the next dev.
+            pos_ += kHeaderSize;
+            return Result{std::unexpected(ParseError::UnknownSap)};
+        }
+
+        switch (*sap) {
+            case Sap::Inputs:
+                break;  // fall through to payload validation below
+            case Sap::Heartbeat:
+                // A *received* Heartbeat is not expected on the host side in
+                // this assignment, but the seam exists: route it to its own
+                // handler here. For now, consume and report as unexpected.
+                pos_ += kHeaderSize;
+                return Result{std::unexpected(ParseError::UnknownSap)};
+        }
+
+        // 5. Inputs frame: payload length is byte 5; full frame includes the
+        //    trailing payload CRC.
         const std::uint8_t payload_len = f[5];
         const std::size_t total = kHeaderSize + payload_len + 1;  // + payload CRC
         if (avail < total) {
-            return std::nullopt;  // truncated mid-payload: wait for more
+            return std::nullopt;  // truncated mid-payload: wait for more bytes
         }
 
-        // 5. Payload CRC covers the payload_len bytes between the two CRCs.
+        // 6. Payload CRC covers the payload_len bytes between the two CRCs.
         const std::uint8_t pay_crc = crc8_smbus(
             std::span<const std::uint8_t>(f + kHeaderSize, payload_len));
         if (pay_crc != f[kHeaderSize + payload_len]) {
@@ -108,9 +138,10 @@ std::optional<FrameParser::Result> FrameParser::next() {
             return Result{std::unexpected(ParseError::PayloadCrcMismatch)};
         }
 
-        // 6. Payload trusted. device_type is the first payload byte (byte 7).
-        const std::uint8_t device_type = f[kHeaderSize];
-        auto payload = build_payload(f + kHeaderSize, device_type, payload_len);
+        // 7. Payload trusted. device_type is the first payload byte (byte 7).
+        const std::uint8_t device_type_byte = f[kHeaderSize];
+        auto payload =
+            build_payload(f + kHeaderSize, device_type_byte, payload_len);
         pos_ += total;  // consume the frame regardless of payload-level outcome
 
         if (!payload) {
