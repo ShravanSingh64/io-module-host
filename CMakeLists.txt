@@ -10,8 +10,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # Header/source library (grows as we add protocol, parser, transport).
-add_library(iomh INTERFACE)
-target_include_directories(iomh INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_library(iomh STATIC src/frame_parser.cpp)
+target_include_directories(iomh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # --- Tests ---
 include(FetchContent)
@@ -26,3 +26,7 @@ enable_testing()
 add_executable(test_crc unit_tests/test_crc.cpp)
 target_link_libraries(test_crc PRIVATE iomh doctest::doctest)
 add_test(NAME test_crc COMMAND test_crc)
+
+add_executable(test_parser unit_tests/test_parser.cpp)
+target_link_libraries(test_parser PRIVATE iomh doctest::doctest)
+add_test(NAME test_parser COMMAND test_parser)
