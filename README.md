@@ -2,33 +2,32 @@
 
 A C++23 host that polls IO modules over a simulated half-duplex serial link,
 parses the binary response frames, and handles error conditions (corruption,
-truncation, desync) without crashing or hanging. Includes a simulator
-emulating a Digital IO module (0x01) and a Push Button (0x02).
+truncation, desync) without crashing or hanging. Includes a simulator emulating
+a Digital IO module (0x01) and a Push Button (0x02).
 
 ## Build & Run
 
 Developed on **WSL2, Ubuntu 24.04.1 LTS**. The default toolchain didn't include
-a C++23-capable GCC, so I installed and built with **GCC 12** (`g++-12`), which
-provides the `std::expected` and `std::span` used here. Any compiler with
-`<expected>` support (GCC 12+ / Clang 16+) should work.
+a C++23-capable GCC, so I built with **GCC 12** (`g++-12`) for `std::expected`
+and `std::span`. Any compiler with `<expected>` support (GCC 12+ / Clang 16+)
+works.
 
 ```bash
 mkdir build && cd build
 cmake -DCMAKE_CXX_COMPILER=g++-12 .. && cmake --build . && ./bin/host && ctest --output-on-failure
 ```
 
-This configures with GCC 12, builds the host/simulator/tests, runs the demo,
-and runs the unit tests. The demo polls both devices, then deliberately drives
-the error paths (corrupted payload CRC, truncated response) and an unaddressed
-device, so the output exercises the robustness requirements in one run.
+The demo polls both devices, then deliberately drives the error paths (corrupted
+payload CRC, truncated response) and an unaddressed device, exercising the
+robustness requirements in one run.
 
 ## Architecture
 
-Three strictly separated layers, connected only through interfaces:
+Three layers, connected only through interfaces:
 
 - **Transport** (`ISerialLink`) — a minimal read/write byte interface.
   `SimulatedLink` is an in-memory, half-duplex implementation (two directional
-  queues). A real serial port would drop in behind the same interface without
+  queues). A real serial port drops in behind the same interface without
   touching host or parser code.
 - **Parsing** (`FrameParser`) — pure: bytes in, typed frames or errors out, no
   I/O. Push-based (`feed` / `next`), which is what makes truncation safe.
@@ -38,103 +37,88 @@ Three strictly separated layers, connected only through interfaces:
 
 ## Repository structure
 
-The work is split across feature branches to keep each a reviewable unit: the
-protocol layer (CRC, frame types, parser), the simulator and host, and the Push
-Button bonus isolated on its own branch — partly so the bonus diff is itself
-evidence of how cleanly the design extends to a new device. This structure is
-CI-ready: a build-and-test workflow would gate each branch naturally.
+Work is split across feature branches — protocol layer, simulator/host, and the
+Push Button bonus isolated on its own branch so its diff is itself evidence of
+how cleanly the design extends to a new device. The structure is CI-ready: a
+build-and-test workflow would gate each branch naturally.
 
 ---
 
 ## 1. Frame modeling
 
-Frames are modeled as **typed structs**, never raw byte buffers. The common
-7-byte header is a `FrameHeader` struct; each Inputs payload is its own struct
-(`DigitalIoInputs`, `PushButtonInputs`). A parsed Inputs frame carries its
-payload as `std::variant<DigitalIoInputs, PushButtonInputs>`.
+Frames are typed structs, never raw byte buffers. The 7-byte header is a
+`FrameHeader`; each Inputs payload is its own struct (`DigitalIoInputs`,
+`PushButtonInputs`); a parsed frame carries its payload as
+`std::variant<DigitalIoInputs, PushButtonInputs>`.
 
-The `std::variant` choice is driven directly by the protocol: the device type
-is byte 7 of the payload, so the parser **cannot** know which variant applies
-until it has read and CRC-validated the payload. A variant models exactly that
-"resolved-after-the-fact" nature. Inheritance was rejected — there's no
-behavioral polymorphism here, just a closed set of data shapes, which is the
-textbook case for a variant over a class hierarchy.
+The variant is driven by the protocol: device type is byte 7 of the payload, so
+the parser can't know which variant applies until it has read and CRC-validated
+the payload — a variant models that "resolved-after-the-fact" nature exactly.
+Inheritance was rejected: there's no behavioral polymorphism, just a closed set
+of data shapes, which is the textbook case for a variant over a hierarchy.
 
-SAP (frame type) and device type are modeled as scoped enums
-(`enum class : std::uint8_t`) rather than loose constants. This gives type
-safety at the boundaries and, crucially, **exhaustive-switch warnings**: adding
-a new frame type or device means adding an enum value, and `-Wswitch` then flags
-every dispatch site that hasn't handled it. Client addresses, by contrast, are a
-*range* (0x01–0x1F), so they're validated with a predicate, not enumerated — a
-specific device's address is configuration, not a protocol constant.
-
-Bytes are marshaled to/from the wire **field-by-field**, never via `memcpy` or
-`reinterpret_cast` over a packed struct, to avoid alignment/aliasing UB.
+SAP and device type are scoped enums (`enum class : std::uint8_t`) rather than
+loose constants — for boundary type safety and, crucially, exhaustive-switch
+warnings: a new frame type or device is a new enum value, and `-Wswitch` then
+flags every dispatch site that hasn't handled it. Client addresses, by contrast,
+are a *range* (0x01–0x1F), validated with a predicate rather than enumerated — a
+device's address is configuration, not a protocol constant. Bytes are marshaled
+field-by-field, never `memcpy`/`reinterpret_cast` over a packed struct, to avoid
+alignment/aliasing UB.
 
 **Extending with a new device** is the four-step diff the Push Button bonus
-already demonstrates: add a payload struct, add a variant arm, add an enum value,
-add one case to the parser's device dispatch. The generic validation layer
-(start token, header CRC, length, payload CRC) is device-agnostic and is never
-touched. A new *frame type* (e.g. Outputs) is similar: an enum value plus an arm
-in the SAP dispatch. I implemented an explicit dispatch seam for this rather than
-a handler-registry framework — the explicit version is more legible for the next
-engineer to extend, and a registry is a heavier architectural commitment that
-belongs in a team discussion, not a take-home.
+demonstrates: payload struct, variant arm, enum value, one case in the device
+dispatch. The generic validation layer (start token, header CRC, length, payload
+CRC) is device-agnostic and untouched. A new frame type is similar: an enum value
+plus a SAP-dispatch arm. I chose an explicit dispatch seam over a handler-registry
+framework — the explicit version is more legible for the next engineer, and a
+registry is a heavier architectural commitment that belongs in a team discussion,
+not a take-home.
 
 ## 2. CRC strategy
 
-CRC-8/SMBus is implemented as a **compile-time lookup table** (`consteval`
-table generation into a `constexpr std::array<uint8_t, 256>`). The table holds
-the result of the 8-round bit loop for every possible byte; at runtime each byte
-costs one indexed lookup (`crc = table[crc ^ b]`) instead of eight shift/XOR
-rounds — roughly an 8× speedup for 256 bytes of static storage and zero runtime
-construction cost.
+CRC-8/SMBus is a compile-time lookup table (`consteval` generation into a
+`constexpr std::array<uint8_t, 256>`). The table holds the 8-round bit-loop
+result for every byte; at runtime each byte costs one lookup (`crc = table[crc ^
+b]`) instead of eight shift/XOR rounds — ~8× faster for 256 bytes of static
+storage and zero runtime construction cost.
 
-Correctness is enforced at **compile time**: a `static_assert` checks the
-implementation against the spec's check value (CRC of `"123456789"` == `0xF4`).
-A regression in the CRC fails the *build*, not a runtime test — the earliest
-possible point to catch it, which matters because a wrong CRC corrupts every
-frame silently.
-
-The trade-off considered was table vs. bit-by-bit: bit-by-bit is marginally
-simpler to read but runs the 8-round loop per byte. At this scale the table's
-speed and the compile-time guarantee outweigh the simplicity, with negligible
-memory cost.
+Correctness is enforced at compile time: a `static_assert` checks against the
+spec's check value (CRC of `"123456789"` == `0xF4`). A regression fails the
+*build*, not a runtime test — the earliest catch point, which matters because a
+wrong CRC corrupts every frame silently. Bit-by-bit was the alternative
+(marginally simpler, but the loop runs per byte); at this scale the table's speed
+and compile-time guarantee win at negligible memory cost.
 
 ## 3. Error recovery & resync
 
-The parser is push-based and never blocks, which is the foundation for all three
-error cases:
+The parser is push-based and never blocks, which underpins all three cases:
 
-- **Starting mid-frame (bytes before the first 0xA5):** the parser scans forward
-  one byte at a time to the next start token, discarding only the bytes *before*
-  it — it never flushes the buffer behind a found 0xA5.
-
-- **Corrupted CRC:** handled asymmetrically by design. A **header** CRC failure
-  is treated as a false start token (a 0xA5 that appeared inside garbage or a
-  payload) — the parser advances **exactly one byte** and resumes scanning. A
-  **payload** CRC failure happens only after the header CRC has already validated
-  the frame's boundaries, so the whole (length-valid) frame is discarded and a
-  `PayloadCrcMismatch` is reported.
-
+- **Starting mid-frame:** scan forward one byte at a time to the next start
+  token, discarding only the bytes *before* it — never flushing behind a found
+  0xA5.
+- **Corrupted CRC:** asymmetric by design. A **header** CRC failure is a false
+  start token (a 0xA5 inside garbage or a payload) — advance *exactly one byte*
+  and resume scanning. A **payload** CRC failure occurs only after the header CRC
+  validated the frame's boundaries, so the whole length-valid frame is discarded
+  and `PayloadCrcMismatch` reported.
 - **Stream stops mid-frame:** `next()` returns `nullopt` ("need more bytes") at
-  either the header or payload boundary, leaving the partial frame buffered. When
-  more bytes arrive it resumes and completes. The parser itself has no timeout —
-  liveness is the host's concern: `Host::read_response` bounds the number of read
-  attempts, so a stream that never completes surfaces as `NoResponse` rather than
-  hanging.
+  the header or payload boundary, leaving the partial frame buffered to resume
+  when more arrive. The parser has no timeout — liveness is the host's concern:
+  `Host::read_response` bounds read attempts, so a stream that never completes
+  surfaces as `NoResponse` rather than hanging.
 
 **Avoiding permanent desync after a single bad byte** is the key invariant: a
-header-CRC failure advances exactly *one* byte, never a guessed frame length (the
-length field can't be trusted if the header is corrupt). So a single bad byte
-costs at most one resync step, and a real frame sitting immediately behind a
-false 0xA5 is always recovered. This is covered by a test that plants a 0xA5
-inside garbage *before* a valid frame and asserts the valid frame is still parsed.
+header-CRC failure advances exactly one byte, never a guessed length (the length
+field is untrustworthy if the header is corrupt). A single bad byte costs at most
+one resync step, and a real frame sitting behind a false 0xA5 is always recovered
+— covered by a test that plants a 0xA5 in garbage before a valid frame and
+asserts the valid frame still parses.
 
-Note: a truncated response surfaces to the host as `NoResponse` rather than a
-distinct "truncated" error — intentional, because on a real bus the host cannot
-distinguish "device went silent" from "device sent a partial frame and stopped";
-both are silence, both are handled by re-polling.
+A truncated response surfaces to the host as `NoResponse`, not a distinct
+"truncated" error — intentional, since on a real bus the host can't distinguish
+"device went silent" from "device sent a partial frame and stopped"; both are
+silence, handled by re-polling.
 
 ## 4. AI usage
 
